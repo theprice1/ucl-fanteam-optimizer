@@ -42,7 +42,7 @@ div[data-testid="stMetricValue"] { color: #f4c430; font-family: 'Oswald', sans-s
 """
 st.markdown(CSS, unsafe_allow_html=True)
 
-VICE_WEIGHT = 0.2  # the vice scores double only if the captain doesn't play, so count about a fifth
+VICE_WEIGHT = 0.2  # vice scores double only if captain doesn't play
 MAX_PER_CLUB = 3
 
 
@@ -70,9 +70,16 @@ def build_lineup(pool, values, cfg, locks, excludes, previous):
     prob += cost <= cfg["budget"]
     if cfg["min_spend"] > 0:
         prob += cost >= cfg["min_spend"]
+    
+    # Position constraints
     prob += pulp.lpSum(x[i] for i in ids if pos[i] == "GK") == 1
-    for code, minimum in (("D", 3), ("M", 3), ("F", 2)):
-        prob += pulp.lpSum(x[i] for i in ids if pos[i] == code) >= minimum
+    
+    # Dynamic or standard defensive formations
+    min_d, min_m, min_f = cfg["formation"]
+    prob += pulp.lpSum(x[i] for i in ids if pos[i] == "D") >= min_d
+    prob += pulp.lpSum(x[i] for i in ids if pos[i] == "M") >= min_m
+    prob += pulp.lpSum(x[i] for i in ids if pos[i] == "F") >= min_f
+
     for name in club.unique():
         prob += pulp.lpSum(x[i] for i in ids if club[i] == name) <= MAX_PER_CLUB
 
@@ -98,7 +105,8 @@ def build_lineup(pool, values, cfg, locks, excludes, previous):
             if cfg["stack"] == "Stack + bring-back":
                 opp = cfg["opp"].get(name)
                 opp_members = [i for i in ids if club[i] == opp]
-                prob += pulp.lpSum(x[i] for i in opp_members) >= flag
+                if opp_members:
+                    prob += pulp.lpSum(x[i] for i in opp_members) >= flag
 
     for prev in previous:
         prob += pulp.lpSum(x[i] for i in prev if i in x) <= cfg["max_overlap"]
@@ -154,7 +162,7 @@ try:
         proj, updated = live_projections()
     elif proj_file is not None:
         proj = dl.load_projections_csv(proj_file)
-except Exception as exc:  # network, page layout or CSV problems
+except (OSError, ValueError, pd.errors.ParserError) as exc:
     error = str(exc)
 if proj is None:
     st.warning(
@@ -180,6 +188,19 @@ with st.sidebar:
     mode = st.radio("Mode", ["Pure Projection", "Cash", "GPP"])
     budget = st.slider("Budget cap (m)", 60.0, 120.0, 120.0, 0.5)
     min_spend = st.slider("Minimum spend (m)", 0.0, 120.0, 0.0, 0.5)
+    
+    formation_choice = st.selectbox(
+        "Minimum Formation (D-M-F)",
+        ["Standard (3-3-2)", "Heavy Defense (4-3-2)", "Heavy Midfield (3-4-2)", "Heavy Attack (3-3-3)"]
+    )
+    form_map = {
+        "Standard (3-3-2)": (3, 3, 2),
+        "Heavy Defense (4-3-2)": (4, 3, 2),
+        "Heavy Midfield (3-4-2)": (3, 4, 2),
+        "Heavy Attack (3-3-3)": (3, 3, 3)
+    }
+    min_formation = form_map[formation_choice]
+
     stack = st.selectbox(
         "Stacking", ["None", "Stack (no bring-back)", "Stack + bring-back"]
     )
@@ -188,9 +209,13 @@ with st.sidebar:
     max_overlap = st.slider("Max shared players between lineups", 1, 10, 7)
     upside = st.slider("GPP upside weight", 0.0, 1.0, 0.5, disabled=mode != "GPP")
     allow_possible = st.checkbox("Allow 'possible' starters", value=True)
+    
     st.header("3 · Include / exclude")
-    locks = st.multiselect("Lock in", sorted(name_to_id))
-    fades = st.multiselect("Exclude", sorted(name_to_id))
+    search_filter = st.text_input("Search players for lock/fade", "")
+    filtered_names = sorted([n for n in name_to_id if search_filter.lower() in n.lower()])
+    locks = st.multiselect("Lock in", filtered_names)
+    fades = st.multiselect("Exclude", filtered_names)
+    
     st.header("4 · Kick-off")
     kick = st.time_input(
         "Kick-off (UK time)", value=datetime.strptime("20:00", "%H:%M").time()
@@ -211,8 +236,10 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-with st.expander("Data check"):
+with st.expander("Data check & Diagnostics"):
     st.write(report)
+    club_counts = merged["Club"].value_counts()
+    st.bar_chart(club_counts)
 
 if min_spend > budget:
     st.error("The minimum spend is above the budget cap.")
@@ -241,12 +268,11 @@ if lock_ids & fade_ids:
     st.error("A player is both locked and excluded.")
     st.stop()
 
-# Value per player for the chosen mode (expected points from the availability blend).
 if mode == "Pure Projection":
     values = {i: static[i] for i in pool["Fanteam ID"]}
 elif mode == "Cash":
     values = {i: static[i] - 0.5 * pstart[i] * gap[i] for i in pool["Fanteam ID"]}
-else:  # GPP: reward upside, weighted by how likely the player is to start
+else:
     values = {i: static[i] + upside * pstart[i] * gap[i] for i in pool["Fanteam ID"]}
 
 cfg = {
@@ -256,6 +282,7 @@ cfg = {
     "stack_size": stack_size,
     "opp": opp_map,
     "max_overlap": max_overlap,
+    "formation": min_formation,
 }
 
 with st.expander(f"Player pool ({len(pool)} players, {mode})"):
@@ -283,9 +310,13 @@ if st.button("Build lineups", type="primary"):
     names = dict(zip(merged["Fanteam ID"], merged["Player"]))
     exports = []
     for n, (chosen, cap, vice, total, detail) in enumerate(results, 1):
+        # Robust sorting by safety-net priority / expectation
+        ordered_chosen = sorted(
+            chosen, key=lambda i: detail[i]["expected"], reverse=True
+        )
         lineup_rows = merged[merged["Fanteam ID"].isin(chosen)].set_index("Fanteam ID")
         table_rows = []
-        for i in chosen:
+        for i in ordered_chosen:
             rep = detail[i]["replacement"]
             table_rows.append(
                 {
@@ -301,7 +332,7 @@ if st.button("Build lineups", type="primary"):
                     "Role": "Captain" if i == cap else "Vice" if i == vice else "",
                 }
             )
-        table = pd.DataFrame(table_rows).sort_values("Expected", ascending=False)
+        table = pd.DataFrame(table_rows)
         exports.append(table.assign(Lineup=n))
 
         st.subheader(f"Lineup {n}")
@@ -316,9 +347,10 @@ if st.button("Build lineups", type="primary"):
         st.dataframe(table, hide_index=True)
 
     if exports:
+        combined_export = pd.concat(exports)
         st.download_button(
-            "Download lineups (CSV)",
-            pd.concat(exports).to_csv(index=False),
-            file_name="ucl_lineups.csv",
+            "Download all lineups (CSV)",
+            combined_export.to_csv(index=False),
+            file_name="ucl_lineups_optimized.csv",
             mime="text/csv",
         )

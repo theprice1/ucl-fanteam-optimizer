@@ -1,15 +1,4 @@
-"""Data layer for the Fanteam Champions League optimizer (stage 1).
-
-Loads projections (live from the Daily Fantasy Tips Fanteam tab, or an uploaded
-CSV), loads the Fanteam player list, joins them on Fanteam ID, and values each
-player with the availability blend:
-
-    expected = p * own_proj + (1 - p) * replacement_proj
-
-p is the chance the player starts: expected 1.0, possible 0.5, unexpected 0.1,
-injured 0.0. The replacement is the first safety-net candidate that is not
-already in the lineup, or 0 if there is none.
-"""
+"""Data layer for the Fanteam Champions League optimizer (stage 1)."""
 
 from __future__ import annotations
 
@@ -41,22 +30,24 @@ BUDGET = 120.0
 def _clean_projections(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
-    df["Player"] = (
-        df["Player"].astype(str).str.replace(STATUS_TAG, "", regex=True).str.strip()
-    )
+    if "Player" in df.columns:
+        df["Player"] = (
+            df["Player"].astype(str).str.replace(STATUS_TAG, "", regex=True).str.strip()
+        )
     for col in NUMERIC_COLS:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["Fanteam ID"] = (
-        df["Fanteam ID"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
-    )
-    df["Pos"] = df["Pos"].astype(str).str.strip().str.upper()
-    return df.reset_index(drop=True)
+    if "Fanteam ID" in df.columns:
+        df["Fanteam ID"] = (
+            df["Fanteam ID"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+        )
+    if "Pos" in df.columns:
+        df["Pos"] = df["Pos"].astype(str).str.strip().str.upper()
+    return df.drop_duplicates(subset=["Fanteam ID"]).reset_index(drop=True)
 
 
 def parse_fanteam_html(html: str) -> tuple[pd.DataFrame, str | None]:
     """Find the Fanteam projections table (the one with a Fanteam ID column)."""
-    # Use the "Last updated" stamp closest above the Fanteam table, not the first on the page.
     stamp_re = r"Last updated:\s*([0-9/]+,?\s*[0-9:]+)"
     anchor = html.find("Fanteam ID")
     stamps = list(re.finditer(stamp_re, html[:anchor] if anchor > 0 else html))
@@ -90,7 +81,7 @@ def load_player_list(source) -> pd.DataFrame:
     df["Lineup"] = df["Lineup"].str.strip().str.lower()
     df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
     df["FullName"] = (df["FName"].fillna("") + " " + df["Name"].fillna("")).str.strip()
-    return df.reset_index(drop=True)
+    return df.drop_duplicates(subset=["PlayerID"]).reset_index(drop=True)
 
 
 def merge_projections(
@@ -122,7 +113,7 @@ def safety_net_chains(
     players: pd.DataFrame, candidate_statuses=("expected",)
 ) -> dict[str, list[str]]:
     """Replacement candidates per player: same club and position, equal or cheaper
-    price, closest price first. Candidates must have a status in candidate_statuses."""
+    price, closest price first."""
     pool = players[players["Lineup"].isin(candidate_statuses)]
     chains = {}
     for _, row in players.iterrows():
@@ -150,15 +141,14 @@ def pick_replacement(player_id: str, chains: dict, taken: set[str]) -> str | Non
 def lineup_expected_points(
     lineup_ids, values, p_start, chains, captain=None, vice=None
 ):
-    """Expected points for a lineup, with safety-net swaps resolved against the lineup.
-
-    values: Proj by Fanteam ID. The captain's expected points are counted a second time.
-    The vice captain's are counted again with probability (1 - captain's start chance).
-    Approximation: a player with p < 1 reserves their replacement, even if they do start.
-    """
+    """Expected points for a lineup, with safety-net swaps resolved against the lineup."""
     taken = set(lineup_ids)
     detail, total = {}, 0.0
-    for pid in lineup_ids:
+    
+    # Sort by start probability and value so high-risk players reserve replacements first
+    ordered_ids = sorted(lineup_ids, key=lambda pid: (p_start.get(pid, 0.0), -values.get(pid, 0.0)))
+    
+    for pid in ordered_ids:
         p = p_start.get(pid, 0.0)
         rep = pick_replacement(pid, chains, taken) if p < 1 else None
         if rep:
@@ -167,6 +157,7 @@ def lineup_expected_points(
         expected = p * values.get(pid, 0.0) + (1 - p) * rep_pts
         detail[pid] = {"expected": round(expected, 2), "replacement": rep}
         total += expected
+        
     if captain:
         total += detail[captain]["expected"]
     if vice:
@@ -176,16 +167,13 @@ def lineup_expected_points(
 
 
 def static_expected_points(merged: pd.DataFrame, chains: dict) -> dict[str, float]:
-    """Lineup-independent values for the optimizer: the replacement is the first
-    chain candidate, ignoring what else is in the lineup. Lineup-level valuation
-    above is the one to trust for final numbers."""
     proj = dict(zip(merged["Fanteam ID"], merged["Proj"]))
     p = dict(zip(merged["Fanteam ID"], merged["p_start"]))
     out = {}
-    for pid in proj:
+    for pid, pts in proj.items():
         chain = chains.get(pid, [])
         rep_pts = proj.get(chain[0], 0.0) if chain else 0.0
-        out[pid] = p[pid] * proj[pid] + (1 - p[pid]) * rep_pts
+        out[pid] = p[pid] * pts + (1 - p[pid]) * rep_pts
     return out
 
 
@@ -193,7 +181,6 @@ def static_expected_points(merged: pd.DataFrame, chains: dict) -> dict[str, floa
 
 
 def check_lineup(merged: pd.DataFrame, lineup_ids, budget: float = BUDGET) -> list[str]:
-    """Fanteam rules: 11 players, 1 GK, at least 3 D, 3 M and 2 F, max 3 per club, within budget."""
     rows = merged.set_index("Fanteam ID").loc[list(lineup_ids)]
     problems = []
     if len(lineup_ids) != 11:
